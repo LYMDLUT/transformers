@@ -163,16 +163,16 @@ def eager_attention_forward(
     # Take the dot product between "query" and "key" to get the raw attention scores.
     attn_weights = torch.matmul(query, key.transpose(-1, -2)) * scaling
 
+    # Apply attention mask before softmax if provided
+    if attention_mask is not None:
+        attn_weights = attn_weights + attention_mask
+
     # Normalize the attention scores to probabilities.
     attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
 
     # This is actually dropping out entire tokens to attend to, which might
     # seem a bit unusual, but is taken from the original Transformer paper.
     attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
-
-    # Mask heads if we want to
-    if attention_mask is not None:
-        attn_weights = attn_weights * attention_mask
 
     attn_output = torch.matmul(attn_weights, value)
     attn_output = attn_output.transpose(1, 2).contiguous()
@@ -202,28 +202,17 @@ class Dinov2SelfAttention(nn.Module):
         self.key = nn.Linear(config.hidden_size, self.all_head_size, bias=config.qkv_bias)
         self.value = nn.Linear(config.hidden_size, self.all_head_size, bias=config.qkv_bias)
 
+    def transpose_for_scores(self, x: torch.Tensor) -> torch.Tensor:
+        new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
+        x = x.view(new_x_shape)
+        return x.permute(0, 2, 1, 3)
+
     def forward(
-        self,
-        hidden_states,
-        head_mask: Optional[torch.Tensor] = None,
-        output_attentions: bool = False,
+        self, hidden_states, head_mask: Optional[torch.Tensor] = None, output_attentions: bool = False, attention_mask: Optional[torch.Tensor] = None
     ) -> Union[tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor]]:
-        batch_size, seq_length, _ = hidden_states.shape
-        key_layer = (
-            self.key(hidden_states)
-            .view(batch_size, -1, self.num_attention_heads, self.attention_head_size)
-            .transpose(1, 2)
-        )
-        value_layer = (
-            self.value(hidden_states)
-            .view(batch_size, -1, self.num_attention_heads, self.attention_head_size)
-            .transpose(1, 2)
-        )
-        query_layer = (
-            self.query(hidden_states)
-            .view(batch_size, -1, self.num_attention_heads, self.attention_head_size)
-            .transpose(1, 2)
-        )
+        key_layer = self.transpose_for_scores(self.key(hidden_states))
+        value_layer = self.transpose_for_scores(self.value(hidden_states))
+        query_layer = self.transpose_for_scores(self.query(hidden_states))
 
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
@@ -235,12 +224,30 @@ class Dinov2SelfAttention(nn.Module):
             else:
                 attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
+        # Process attention_mask if provided
+        processed_attention_mask = head_mask
+        if attention_mask is not None:
+            # 原始 attention_mask 形状: [batch_size, seq_length]
+            broadcastable_attention_mask = attention_mask[:, None, None, :]
+
+            # 如果需要，将布尔掩码转换为浮点数
+            if broadcastable_attention_mask.dtype == torch.bool:
+                broadcastable_attention_mask = broadcastable_attention_mask.float()
+
+            # 创建加性掩码 (additive mask)，值为 0 的位置会变为一个很大的负数
+            # 形状仍然是 [batch_size, 1, 1, seq_length]，可以在加法中广播
+            processed_attention_mask = (1.0 - broadcastable_attention_mask) * torch.finfo(query_layer.dtype).min
+
+            # 如果 head_mask 也存在，则合并它们
+            if head_mask is not None:
+                processed_attention_mask = processed_attention_mask + head_mask
+
         context_layer, attention_probs = attention_interface(
             self,
             query_layer,
             key_layer,
             value_layer,
-            head_mask,
+            processed_attention_mask,
             is_causal=self.is_causal,
             scaling=self.scaling,
             dropout=0.0 if not self.training else self.dropout_prob,
@@ -304,8 +311,9 @@ class Dinov2Attention(nn.Module):
         hidden_states: torch.Tensor,
         head_mask: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> Union[tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor]]:
-        self_outputs = self.attention(hidden_states, head_mask, output_attentions)
+        self_outputs = self.attention(hidden_states, head_mask, output_attentions, attention_mask)
 
         attention_output = self.output(self_outputs[0], hidden_states)
 
@@ -418,11 +426,13 @@ class Dinov2Layer(GradientCheckpointingLayer):
         hidden_states: torch.Tensor,
         head_mask: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> Union[tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor]]:
         self_attention_outputs = self.attention(
             self.norm1(hidden_states),  # in Dinov2, layernorm is applied before self-attention
             head_mask,
             output_attentions=output_attentions,
+            attention_mask=attention_mask,
         )
         attention_output = self_attention_outputs[0]
 
@@ -460,6 +470,7 @@ class Dinov2Encoder(nn.Module):
         output_attentions: bool = False,
         output_hidden_states: bool = False,
         return_dict: bool = True,
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> Union[tuple, BaseModelOutput]:
         all_hidden_states = () if output_hidden_states else None
         all_self_attentions = () if output_attentions else None
@@ -470,7 +481,7 @@ class Dinov2Encoder(nn.Module):
 
             layer_head_mask = head_mask[i] if head_mask is not None else None
 
-            layer_outputs = layer_module(hidden_states, layer_head_mask, output_attentions)
+            layer_outputs = layer_module(hidden_states, layer_head_mask, output_attentions, attention_mask)
 
             hidden_states = layer_outputs[0]
 
@@ -491,13 +502,13 @@ class Dinov2Encoder(nn.Module):
 
 @auto_docstring
 class Dinov2PreTrainedModel(PreTrainedModel):
-    config: Dinov2Config
+    config_class = Dinov2Config
     base_model_prefix = "dinov2"
     main_input_name = "pixel_values"
     supports_gradient_checkpointing = True
     _no_split_modules = ["Dinov2Layer"]
     _supports_sdpa = True
-    _supports_flash_attn = True
+    _supports_flash_attn_2 = True
     _supports_flex_attn = True
     _supports_attention_backend = True
 
@@ -567,11 +578,16 @@ class Dinov2Model(Dinov2PreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> Union[tuple, BaseModelOutputWithPooling]:
         r"""
         bool_masked_pos (`torch.BoolTensor` of shape `(batch_size, sequence_length)`):
             Boolean masked positions. Indicates which patches are masked (1) and which aren't (0). Only relevant for
             pre-training.
+        attention_mask (`torch.Tensor` of shape `(batch_size, sequence_length)`, *optional*):
+            Mask to avoid performing attention on padding token indices. Mask values selected in `[0, 1]`:
+            - 1 for tokens that are **not masked**,
+            - 0 for tokens that are **masked**.
         """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -597,6 +613,7 @@ class Dinov2Model(Dinov2PreTrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            attention_mask=attention_mask,
         )
         sequence_output = encoder_outputs[0]
         sequence_output = self.layernorm(sequence_output)
@@ -644,12 +661,17 @@ class Dinov2ForImageClassification(Dinov2PreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> Union[tuple, ImageClassifierOutput]:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
             Labels for computing the image classification/regression loss. Indices should be in `[0, ...,
             config.num_labels - 1]`. If `config.num_labels == 1` a regression loss is computed (Mean-Square loss), If
             `config.num_labels > 1` a classification loss is computed (Cross-Entropy).
+        attention_mask (`torch.Tensor` of shape `(batch_size, sequence_length)`, *optional*):
+            Mask to avoid performing attention on padding token indices. Mask values selected in `[0, 1]`:
+            - 1 for tokens that are **not masked**,
+            - 0 for tokens that are **masked**.
         """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
@@ -659,6 +681,7 @@ class Dinov2ForImageClassification(Dinov2PreTrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            attention_mask=attention_mask,
         )
 
         sequence_output = outputs[0]  # batch_size, sequence_length, hidden_size
@@ -736,6 +759,7 @@ class Dinov2Backbone(Dinov2PreTrainedModel, BackboneMixin):
         output_hidden_states: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> BackboneOutput:
         r"""
         Examples:
@@ -770,7 +794,7 @@ class Dinov2Backbone(Dinov2PreTrainedModel, BackboneMixin):
         embedding_output = self.embeddings(pixel_values)
 
         outputs = self.encoder(
-            embedding_output, output_hidden_states=True, output_attentions=output_attentions, return_dict=return_dict
+            embedding_output, output_hidden_states=True, output_attentions=output_attentions, return_dict=return_dict, attention_mask=attention_mask
         )
 
         hidden_states = outputs.hidden_states if return_dict else outputs[1]
